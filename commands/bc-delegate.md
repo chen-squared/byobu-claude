@@ -40,7 +40,7 @@ You must:
    - Relevant file paths and their purposes
    - Architecture decisions or constraints
    - Expected behavior and acceptance criteria
-   - The result file path: `/tmp/claude-comm/tasks/<task_id>.result.md`
+   - The result file path: `$BC_COMM_DIR/tasks/<task_id>.result.md` (get `BC_COMM_DIR` by running `echo $BC_COMM_DIR`)
    - Remind the child to run `bash $BC done <task_id>` when complete
    - Remind the child to run `bash $BC notify "Task <task_id> completed"` to notify you
 

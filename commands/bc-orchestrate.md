@@ -28,7 +28,7 @@ For each sub-task:
 3. Send the task: `bash "$BC" send <task_id> '<task description>'`
 4. Include in the message:
    - Full task context
-   - Result file: `/tmp/claude-comm/tasks/<task_id>.result.md`
+   - Result file: `$BC_COMM_DIR/tasks/<task_id>.result.md` (get `BC_COMM_DIR` by running `echo $BC_COMM_DIR`)
    - Completion commands: `bash $BC done <task_id>` and `bash $BC notify "Task <task_id> completed"`
 
 ## Phase 3: Wait

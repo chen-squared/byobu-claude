@@ -32,17 +32,18 @@ Use `/bc-delegate` for single tasks, `/bc-orchestrate` for complex multi-step go
 │  │          │ <─────────────── │  (bc-{task_id})  │ │
 │  └──────────┘  bc.sh notify    └──────────────────┘ │
 │                                                     │
-│  Communication: /tmp/claude-comm/                   │
+│  Communication: $BC_COMM_DIR/                       │
 │  ├── tasks/{id}.result.md    (result files)         │
 │  ├── status/{id}.status      (pending/running/done) │
-│  └── registry.json           (child registry)       │
+│  ├── registry.json           (child registry)       │
+│  └── master.lock             (master identity)      │
 └─────────────────────────────────────────────────────┘
 ```
 
 **Communication flow:**
 - Main → Child: `tmux send-keys` sends prompts directly into child's Claude Code session
 - Child → Main: `bc.sh notify` sends a message back to the main process via `tmux send-keys`
-- Results: Children write results to `/tmp/claude-comm/tasks/{id}.result.md`
+- Results: Children write results to `$BC_COMM_DIR/tasks/{id}.result.md`
 - Children run interactively with `--dangerously-skip-permissions` and persist their sessions
 
 ## Installation
@@ -90,7 +91,7 @@ bc.sh <command> [args...]
 
 | Command | Description |
 |---------|-------------|
-| `init` | Initialize communication directory `/tmp/claude-comm/` |
+| `init` | Initialize communication directory and register master identity |
 | `spawn [--workdir <dir>] [--model <m>] [--name <n>]` | Spawn a child Claude Code in a new tmux window |
 | `send <task_id> <message>` | Send a message/task to a child via `tmux send-keys` |
 | `status [task_id]` | Show status of all children (or a specific one) |
@@ -112,7 +113,7 @@ All settings are configurable via environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BC_HOME` | *(required for slash commands)* | Path to byobu-claude directory |
-| `BC_COMM_DIR` | `/tmp/claude-comm` | Communication directory for task files and registry |
+| `BC_COMM_DIR` | `/tmp/claude-comm` | Communication directory (auto-namespaced by session when using `master`) |
 | `BC_MAX_CHILDREN` | `10` | Maximum concurrent child processes |
 | `BC_TIMEOUT` | `1800` | Wait timeout in seconds (30 min) |
 | `BC_MAX_RESTARTS` | `20` | Max auto-restarts on crash per child |
@@ -135,7 +136,7 @@ TASK_ID=$(bash bc.sh spawn --workdir /path/to/project --model sonnet)
 
 # Wait for child to start (~8 seconds), then send a task
 sleep 8
-bash bc.sh send $TASK_ID "Review the code in src/ and write a summary to /tmp/claude-comm/tasks/${TASK_ID}.result.md. When done, run: bash bc.sh done ${TASK_ID} && bash bc.sh notify 'Task ${TASK_ID} completed'"
+bash bc.sh send $TASK_ID "Review the code in src/ and write a summary to \$BC_COMM_DIR/tasks/${TASK_ID}.result.md. When done, run: bash bc.sh done ${TASK_ID} && bash bc.sh notify 'Task ${TASK_ID} completed'"
 
 # Check status
 bash bc.sh status
@@ -153,6 +154,20 @@ bash bc.sh send $TASK_ID "Now fix the issues found..."
 bash bc.sh cleanup --done
 ```
 
+### Quick start with `bc.sh master`
+
+The easiest way to get started:
+
+```bash
+# Start a master Claude Code in a new byobu session
+bash bc.sh master --workdir /path/to/your/project
+
+# This opens a new byobu session with Claude Code running.
+# Inside that Claude, use slash commands:
+#   /bc-delegate Review all test files and report coverage gaps
+#   /bc-orchestrate Implement user authentication with tests
+```
+
 ### Via slash commands (recommended)
 
 In Claude Code, just type:
@@ -163,6 +178,20 @@ Or for complex multi-step goals:
 ```
 /bc-orchestrate Implement user authentication with tests
 ```
+
+### Running Multiple Masters
+
+You can run multiple master instances simultaneously, each with its own isolated workspace:
+
+```bash
+# Terminal 1: Start master A
+bash bc.sh master --session bc-master-a --workdir /path/to/project-a
+
+# Terminal 2: Start master B
+bash bc.sh master --session bc-master-b --workdir /path/to/project-b
+```
+
+Each master automatically gets its own `BC_COMM_DIR` (`/tmp/claude-comm-bc-master-a/`, `/tmp/claude-comm-bc-master-b/`). Children, status, and results are fully isolated — masters never see or interfere with each other's tasks.
 
 ## Auto-restart
 
@@ -180,6 +209,17 @@ Children are started with:
 - `--append-system-prompt` — instructs children to write results, call `bc.sh done`, and notify the main process
 
 Children cannot spawn sub-children or communicate with each other. All communication goes through the main process.
+
+## Multi-Master Isolation
+
+Multiple masters can run simultaneously without conflicting:
+
+- **Auto-namespaced directories**: `bc.sh master` automatically sets `BC_COMM_DIR` to `/tmp/claude-comm-{session_name}`, so each master session gets its own communication directory.
+- **Unique master IDs**: Each master gets a unique 8-char hex `master_id`, stored in `master.lock` along with session and window information.
+- **Child filtering**: Commands like `status`, `collect`, `wait`, and `cleanup` only operate on children belonging to the current master.
+- **Targeted notifications**: `bc.sh notify` sends messages to the correct master window using session and window names from `master.lock`.
+
+To explicitly share a `BC_COMM_DIR` across masters (advanced), set `BC_COMM_DIR` before running `bc.sh master`.
 
 ## License
 

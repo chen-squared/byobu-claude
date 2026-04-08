@@ -19,11 +19,16 @@ set -euo pipefail
 # ============================================================
 # Configuration (overridable via environment variables)
 # ============================================================
+# Save original BC_COMM_DIR before applying default (for detecting explicit vs auto-set)
+_BC_COMM_DIR_ORIG="${BC_COMM_DIR:-}"
 BC_COMM_DIR="${BC_COMM_DIR:-/tmp/claude-comm}"
 BC_MAX_CHILDREN="${BC_MAX_CHILDREN:-10}"
 BC_TIMEOUT="${BC_TIMEOUT:-1800}"          # 30 min default
 BC_POLL_INTERVAL="${BC_POLL_INTERVAL:-5}" # seconds
 BC_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Master ID -- set by cmd_init, inherited by wrapper and children
+BC_MASTER_ID="${BC_MASTER_ID:-}"
 
 # ============================================================
 # Helpers
@@ -174,8 +179,39 @@ _set_status() {
 }
 
 _get_master_pane() {
+    # Read pane_id from master.lock (field 3)
     if [[ -f "$BC_COMM_DIR/master.lock" ]]; then
-        cut -d'|' -f2 "$BC_COMM_DIR/master.lock"
+        cut -d'|' -f3 "$BC_COMM_DIR/master.lock"
+    fi
+}
+
+_get_master_session() {
+    # Read master session name from master.lock (field 4: MASTER_ID|PID|PANE_ID|SESSION|WINDOW|TIMESTAMP)
+    if [[ -f "$BC_COMM_DIR/master.lock" ]]; then
+        cut -d'|' -f4 "$BC_COMM_DIR/master.lock"
+    fi
+}
+
+_get_master_window() {
+    # Read master window name from master.lock (field 5)
+    if [[ -f "$BC_COMM_DIR/master.lock" ]]; then
+        cut -d'|' -f5 "$BC_COMM_DIR/master.lock"
+    fi
+}
+
+_get_master_id() {
+    # Read master_id from master.lock (field 1)
+    if [[ -f "$BC_COMM_DIR/master.lock" ]]; then
+        cut -d'|' -f1 "$BC_COMM_DIR/master.lock"
+    fi
+}
+
+# Get the current master ID -- use BC_MASTER_ID env if set, otherwise read from lock
+_get_current_master_id() {
+    if [[ -n "$BC_MASTER_ID" ]]; then
+        echo "$BC_MASTER_ID"
+    else
+        _get_master_id
     fi
 }
 
@@ -199,17 +235,34 @@ _count_active_children() {
 # ============================================================
 
 cmd_init() {
+    # If already initialized (master.lock exists with valid master_id), just reload it
+    if [[ -f "$BC_COMM_DIR/master.lock" ]]; then
+        local existing_id
+        existing_id=$(_get_master_id)
+        if [[ -n "$existing_id" ]]; then
+            export BC_MASTER_ID="$existing_id"
+            _log "Already initialized: $BC_COMM_DIR (master_id: $existing_id)"
+            return 0
+        fi
+    fi
+
     mkdir -p "$BC_COMM_DIR"/{tasks,status,logs}
     if [[ ! -f "$BC_COMM_DIR/registry.json" ]]; then
         echo '[]' > "$BC_COMM_DIR/registry.json"
     fi
 
-    # Write master lock: PID|PANE_ID|TIMESTAMP
-    local pane_id
+    # Generate new master_id and write master lock: MASTER_ID|PID|PANE_ID|SESSION|WINDOW|TIMESTAMP
+    local master_id pane_id session_name window_name
+    master_id=$(_gen_id)
     pane_id=$(tmux display-message -p '#{pane_id}' 2>/dev/null || echo "unknown")
-    echo "$$|${pane_id}|$(_timestamp)" > "$BC_COMM_DIR/master.lock"
+    session_name=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "unknown")
+    window_name=$(tmux display-message -p '#{window_name}' 2>/dev/null || echo "unknown")
+    echo "${master_id}|$$|${pane_id}|${session_name}|${window_name}|$(_timestamp)" > "$BC_COMM_DIR/master.lock"
 
-    _log "Initialized: $BC_COMM_DIR (master pane: $pane_id)"
+    # Export so child wrappers inherit it
+    export BC_MASTER_ID="$master_id"
+
+    _log "Initialized: $BC_COMM_DIR (master_id: $master_id, pane: $pane_id, session: $session_name, window: $window_name)"
 }
 
 cmd_spawn() {
@@ -229,8 +282,26 @@ cmd_spawn() {
     task_id="${task_id:-$(_gen_id)}"
     name="${name:-bc-${task_id}}"
 
-    # Ensure init
-    [[ -d "$BC_COMM_DIR/tasks" ]] || cmd_init
+    # Ensure init (sets BC_MASTER_ID if not already set).
+    # If BC_MASTER_ID is already set (explicit override for multi-master), respect it.
+    # Otherwise, load from master.lock or initialize fresh.
+    if [[ -z "$BC_MASTER_ID" ]]; then
+        if [[ -d "$BC_COMM_DIR/tasks" ]] && [[ -f "$BC_COMM_DIR/master.lock" ]]; then
+            export BC_MASTER_ID="$(_get_master_id)"
+        else
+            cmd_init
+        fi
+    else
+        # BC_MASTER_ID explicitly set -- warn if it differs from master.lock
+        if [[ -f "$BC_COMM_DIR/master.lock" ]]; then
+            local lock_master_id
+            lock_master_id=$(_get_master_id)
+            if [[ "$BC_MASTER_ID" != "$lock_master_id" ]]; then
+                _log "WARNING: BC_MASTER_ID=$BC_MASTER_ID but master.lock has $lock_master_id"
+                _log "Children will use $BC_MASTER_ID but notify goes to whoever last wrote master.lock"
+            fi
+        fi
+    fi
 
     # Check for duplicate task_id
     local existing
@@ -257,7 +328,7 @@ cmd_spawn() {
 关键约束：
 - 禁止创建子进程或启动其他 Claude 实例
 - 禁止使用 /bc-delegate、/bc-orchestrate 或任何 bc-* 命令
-- 禁止修改 /tmp/claude-comm/ 中非指定的文件
+- 禁止修改 ${BC_COMM_DIR}/ 中非指定的文件
 
 当完成任务后，你必须：
 1. 将结果写入指定的 result 文件（路径会在任务中说明）
@@ -287,8 +358,11 @@ SYSPROMPT
     session=$(tmux display-message -p '#{session_name}' 2>/dev/null) || _die "spawn: not inside tmux/byobu"
     session_target="=${session}"
 
-    # Create new window running the auto-restart wrapper
-    local wrapper_cmd="bash $(printf '%q' "${BC_SCRIPT_DIR}/bc.sh") _wrapper${quoted_args}"
+    # Create new window running the auto-restart wrapper.
+    # Set BC_MASTER_ID and BC_COMM_DIR explicitly; do NOT use env -u since
+    # BC_MASTER_ID may already be correct (passed from parent's exported env).
+    # Both env settings ensure the child sees only the values we explicitly pass.
+    local wrapper_cmd="BC_MASTER_ID=\"$(printf '%s' "$BC_MASTER_ID")\" BC_COMM_DIR=\"$(printf '%s' "$BC_COMM_DIR")\" bash $(printf '%q' "${BC_SCRIPT_DIR}/bc.sh") _wrapper $(printf '%q' "$BC_MASTER_ID")${quoted_args}"
     tmux new-window -d -t "${session_target}" -n "$name" -c "$workdir" "$wrapper_cmd"
 
     # Set remain-on-exit so we can inspect dead panes
@@ -328,10 +402,11 @@ print(json.dumps({
     'workdir': sys.argv[5],
     'model': sys.argv[6],
     'session': sys.argv[7],
-    'spawned_at': sys.argv[8],
+    'master_id': sys.argv[8],
+    'spawned_at': sys.argv[9],
     'status': 'pending'
 }))
-" "$task_id" "$name" "$pane_id" "$pane_pid" "$workdir" "${model:-default}" "$session" "$(_timestamp)")
+" "$task_id" "$name" "$pane_id" "$pane_pid" "$workdir" "${model:-default}" "$session" "$BC_MASTER_ID" "$(_timestamp)")
     _json_registry_append "$entry"
 
     _log "Spawned child: $task_id (window: $name, pane: $pane_id, pid: $pane_pid)"
@@ -385,6 +460,10 @@ cmd_status() {
 
     [[ -d "$BC_COMM_DIR/status" ]] || _die "status: not initialized. Run bc.sh init first."
 
+    # Filter by current master_id if not filtering by specific task_id
+    local current_master_id
+    current_master_id=$(_get_current_master_id)
+
     # Header
     printf "%-10s %-10s %-8s %-16s %-8s %s\n" "TASK_ID" "STATUS" "MODEL" "WINDOW" "AGE" "WORKDIR"
     printf "%-10s %-10s %-8s %-16s %-8s %s\n" "-------" "------" "-----" "------" "---" "-------"
@@ -398,11 +477,16 @@ cmd_status() {
 
         # Safe field extraction without eval
         local fields
-        fields=$(_json_extract_fields "$line" task_id name pane_id model session workdir spawned_at)
-        local task_id name pane_id model session workdir spawned_at
-        { read -r task_id; read -r name; read -r pane_id; read -r model; read -r session; read -r workdir; read -r spawned_at; } <<< "$fields"
+        fields=$(_json_extract_fields "$line" task_id name pane_id model session workdir spawned_at master_id)
+        local task_id name pane_id model session workdir spawned_at master_id
+        { read -r task_id; read -r name; read -r pane_id; read -r model; read -r session; read -r workdir; read -r spawned_at; read -r master_id; } <<< "$fields"
 
-        # Filter if specified
+        # Filter by master_id (only show children of current master)
+        if [[ -n "$current_master_id" && "$master_id" != "$current_master_id" ]]; then
+            continue
+        fi
+
+        # Filter by task_id if specified
         if [[ -n "$filter_id" && "$task_id" != "$filter_id" ]]; then
             continue
         fi
@@ -474,13 +558,23 @@ cmd_collect() {
 
     [[ -d "$BC_COMM_DIR/tasks" ]] || _die "collect: not initialized."
 
+    # Filter by current master_id
+    local current_master_id
+    current_master_id=$(_get_current_master_id)
+
     local listing
     listing=$(_json_registry_list) || _die "collect: failed to read registry"
     local found=0
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
-        local tid
+        local tid master_id
         read -r tid < <(_json_extract_fields "$line" task_id)
+        read -r master_id < <(_json_extract_fields "$line" master_id)
+
+        # Filter by master_id (only collect children of current master)
+        if [[ -n "$current_master_id" && "$master_id" != "$current_master_id" ]]; then
+            continue
+        fi
 
         if [[ -n "$filter_id" && "$tid" != "$filter_id" ]]; then
             continue
@@ -530,14 +624,21 @@ cmd_wait() {
         esac
     done
 
-    # If no task ids given, wait for all running/pending tasks
+    # If no task ids given, wait for all running/pending tasks of current master
     if [[ ${#task_ids[@]} -eq 0 ]]; then
+        local current_master_id
+        current_master_id=$(_get_current_master_id)
         local listing
         listing=$(_json_registry_list) || _die "wait: failed to read registry"
         while IFS= read -r line; do
             [[ -n "$line" ]] || continue
-            local tid
+            local tid master_id
             read -r tid < <(_json_extract_fields "$line" task_id)
+            read -r master_id < <(_json_extract_fields "$line" master_id)
+            # Filter by master_id
+            if [[ -n "$current_master_id" && "$master_id" != "$current_master_id" ]]; then
+                continue
+            fi
             local s
             s=$(_get_status "$tid")
             if [[ "$s" == "running" || "$s" == "pending" ]]; then
@@ -612,16 +713,18 @@ cmd_notify() {
     [[ $# -ge 1 ]] || _die "notify: usage: bc.sh notify <message>"
     local message="$*"
 
-    local master_pane
-    master_pane=$(_get_master_pane)
-    if [[ -z "$master_pane" ]]; then
-        _die "notify: no master pane found. Was init called?"
+    local master_session master_window
+    master_session=$(_get_master_session)
+    master_window=$(_get_master_window)
+    if [[ -z "$master_session" || -z "$master_window" ]]; then
+        _die "notify: no master session/window found. Was init called?"
     fi
 
-    tmux send-keys -t "$master_pane" -l "$message"
-    tmux send-keys -t "$master_pane" Enter
+    # Send to the dedicated master window in its session
+    tmux send-keys -t "=${master_session}:${master_window}" -l "$message"
+    tmux send-keys -t "=${master_session}:${master_window}" Enter
 
-    _log "Notified master ($master_pane): $message"
+    _log "Notified master (${master_session}:${master_window}): $message"
 }
 
 cmd_done() {
@@ -697,6 +800,10 @@ cmd_cleanup() {
         *) _die "cleanup: unknown option: $mode. Use --done, --error, or --all" ;;
     esac
 
+    # Filter by current master_id
+    local current_master_id
+    current_master_id=$(_get_current_master_id)
+
     local listing
     listing=$(_json_registry_list) || _die "cleanup: failed to read registry"
     while IFS= read -r line; do
@@ -704,9 +811,14 @@ cmd_cleanup() {
 
         # Safe field extraction without eval
         local fields
-        fields=$(_json_extract_fields "$line" task_id name session)
-        local task_id name session
-        { read -r task_id; read -r name; read -r session; } <<< "$fields"
+        fields=$(_json_extract_fields "$line" task_id name session master_id)
+        local task_id name session master_id
+        { read -r task_id; read -r name; read -r session; read -r master_id; } <<< "$fields"
+
+        # Filter by master_id (only cleanup children of current master)
+        if [[ -n "$current_master_id" && "$master_id" != "$current_master_id" ]]; then
+            continue
+        fi
 
         local status
         status=$(_get_status "$task_id")
@@ -733,7 +845,10 @@ cmd_cleanup() {
 
 # Auto-restart wrapper: runs claude in a loop, auto-restarts with --continue on crash
 # This runs INSIDE the tmux window, not called by users directly
+# First argument is BC_MASTER_ID, remaining args are claude args
 cmd_wrapper() {
+    local master_id_arg="$1"; shift
+    export BC_MASTER_ID="$master_id_arg"
     local claude_args=("$@")
     local max_restarts="${BC_MAX_RESTARTS:-20}"
     local restart_count=0
@@ -793,6 +908,19 @@ cmd_wrapper() {
     echo "[bc-wrapper] Wrapper finished. Restart count: $restart_count"
 }
 
+# Like cmd_wrapper but first initializes master (used by cmd_master for new sessions)
+# First argument is the master_id, remaining args are claude args.
+# cmd_master already wrote master.lock before spawning this session, so we
+# just set BC_MASTER_ID and delegate to cmd_wrapper (which also expects master_id as $1).
+cmd_master-init-wrapper() {
+    local master_id_arg="$1"
+    export BC_MASTER_ID="$master_id_arg"
+
+    # Pass all args (including master_id) through to cmd_wrapper,
+    # which expects master_id as its first argument.
+    cmd_wrapper "$@"
+}
+
 # Start a master claude in a new byobu session with auto-restart
 cmd_master() {
     local workdir="" session_name="" model="" prompt=""
@@ -809,6 +937,42 @@ cmd_master() {
     workdir="${workdir:-$(pwd)}"
     session_name="${session_name:-bc-master}"
 
+    # Auto-namespace BC_COMM_DIR by session name if not explicitly set by user.
+    # This prevents multiple masters from accidentally sharing the same directory.
+    if [[ -z "${_BC_COMM_DIR_ORIG:-}" ]]; then
+        export BC_COMM_DIR="/tmp/claude-comm-${session_name}"
+        _log "Auto-namespaced BC_COMM_DIR to $BC_COMM_DIR (use explicit BC_COMM_DIR to override)"
+    fi
+
+    # Generate a unique master_id for this master
+    local master_id
+    master_id=$(_gen_id)
+
+    # CRITICAL: write master.lock BEFORE tmux new-session to avoid race condition.
+    # If we wrote it in the wrapper (via cmd_init), multiple masters started
+    # near-simultaneously would race and overwrite each other's master_id.
+    mkdir -p "$BC_COMM_DIR"/{tasks,status,logs}
+    if [[ ! -f "$BC_COMM_DIR/registry.json" ]]; then
+        echo '[]' > "$BC_COMM_DIR/registry.json"
+    fi
+
+    # Check if master.lock already exists with a different master_id (collision or stale).
+    # If so, warn the user -- they may need to clean up or use a different session name.
+    if [[ -f "$BC_COMM_DIR/master.lock" ]]; then
+        local existing_master_id
+        existing_master_id=$(_get_master_id)
+        if [[ -n "$existing_master_id" && "$existing_master_id" != "$master_id" ]]; then
+            _log "WARNING: $BC_COMM_DIR already has master_id $existing_master_id"
+            _log "Starting new master with id $master_id anyway (children may conflict)"
+        fi
+    fi
+
+    local master_window="bc-master"
+    # Format: MASTER_ID|PID|PANE_ID|SESSION|WINDOW|TIMESTAMP
+    # SESSION|WINDOW identify the master's tmux location for notify
+    # pane_id is not yet known (session hasn't been created), use placeholder
+    echo "${master_id}|$$|unknown|${session_name}|${master_window}|$(_timestamp)" > "$BC_COMM_DIR/master.lock"
+
     local claude_args_parts=("--dangerously-skip-permissions")
     if [[ -n "$model" ]]; then
         claude_args_parts+=("--model" "$model")
@@ -819,31 +983,47 @@ cmd_master() {
         quoted_args+=" $(printf '%q' "$arg")"
     done
 
-    local wrapper_cmd="bash $(printf '%q' "${BC_SCRIPT_DIR}/bc.sh") _wrapper${quoted_args}"
+    # Build the full argument list for _master-init-wrapper: master_id + claude args
+    # Each piece must be individually quoted so they survive the outer bash -c parsing
+    local master_id_quoted
+    master_id_quoted=$(printf '%q' "$master_id")
+    # Assemble: master_id first, then claude args (each already quoted by the loop above)
+    local wrapper_args="${master_id_quoted}${quoted_args}"
 
-    # Create new byobu/tmux session in background
-    tmux new-session -d -s "$session_name" -c "$workdir" "$wrapper_cmd"
+    # env -u BC_MASTER_ID: prevent parent's BC_MASTER_ID from leaking.
+    # export BC_COMM_DIR and BC_HOME: ensure these are in the shell's exported environment
+    # so child processes of the master inherit them.
+    # The master runs in a dedicated "bc-master" window so notify goes to a known window.
+    local wrapper_cmd="env -u BC_MASTER_ID bash -c 'export BC_COMM_DIR=\"$(printf '%s' "$BC_COMM_DIR")\" BC_HOME=\"$(printf '%s' "$BC_SCRIPT_DIR")\"; exec bash $(printf '%q' "${BC_SCRIPT_DIR}/bc.sh") _master-init-wrapper ${wrapper_args}'"
 
-    _log "Master session '$session_name' created in $workdir"
+    # Create new byobu/tmux session with master in a named window (not window 0)
+    tmux new-session -d -s "$session_name" -n "$master_window" -c "$workdir" "$wrapper_cmd"
+
+    # Verify the session was created with our window
+    if ! tmux list-windows -t "=${session_name}" -F '#{window_name}' 2>/dev/null | grep -qx "$master_window"; then
+        _die "master: failed to create session $session_name with window $master_window"
+    fi
+
+    _log "Master session '$session_name' created in $workdir (master_id: $master_id)"
     _log "Attach with: byobu attach -t $session_name"
 
     # If a prompt was given, wait for claude to start then send it
     if [[ -n "$prompt" ]]; then
         (
-            # Wait for claude to be ready
+            # Wait for claude to be ready in the bc-master window
             for i in $(seq 1 15); do
                 sleep 2
                 local output
-                output=$(tmux capture-pane -t "=${session_name}" -p 2>/dev/null || true)
+                output=$(tmux capture-pane -t "=${session_name}:${master_window}" -p 2>/dev/null || true)
                 if echo "$output" | grep -q "❯"; then
                     sleep 1
-                    tmux send-keys -t "=${session_name}" -l "$prompt"
-                    tmux send-keys -t "=${session_name}" Enter
+                    tmux send-keys -t "=${session_name}:${master_window}" -l "$prompt"
+                    tmux send-keys -t "=${session_name}:${master_window}" Enter
                     break
                 fi
                 # Auto-accept trust dialog
                 if echo "$output" | grep -q "trust this folder"; then
-                    tmux send-keys -t "=${session_name}" Enter
+                    tmux send-keys -t "=${session_name}:${master_window}" Enter
                 fi
             done
         ) &
@@ -944,6 +1124,7 @@ main() {
         install)  cmd_install "$@" ;;
         master)   cmd_master "$@" ;;
         _wrapper) cmd_wrapper "$@" ;;
+        _master-init-wrapper) cmd_master-init-wrapper "$@" ;;
         help|-h|--help) cmd_help ;;
         *) _die "Unknown command: $cmd. Run 'bc.sh help' for usage." ;;
     esac
